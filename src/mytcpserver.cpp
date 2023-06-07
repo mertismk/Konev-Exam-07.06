@@ -4,6 +4,7 @@ MyTcpServer::~MyTcpServer() {
     // mTcpSocket->close();
     mTcpServer->close();
     server_status = 0;
+    SingletonDB::instance().close();
 }
 
 MyTcpServer::MyTcpServer(QObject *parent) : QObject(parent) {
@@ -18,7 +19,9 @@ MyTcpServer::MyTcpServer(QObject *parent) : QObject(parent) {
         qDebug() << "server is started";
     }
 
-    mParser = new Parsing(this);
+    if (!SingletonDB::instance().open()) {
+        qDebug() << "can't open db";
+    }
 }
 
 void MyTcpServer::slotNewConnection() {
@@ -30,7 +33,6 @@ void MyTcpServer::slotNewConnection() {
                 &MyTcpServer::slotServerRead);
         connect(cur_mTcpSocket, &QTcpSocket::disconnected, this,
                 &MyTcpServer::slotClientDisconnected);
-        cur_mTcpSocket->setObjectName(cur_mTcpSocket->peerAddress().toString());
         mTcpSocket.insert(cur_mTcpSocket->socketDescriptor(), cur_mTcpSocket);
         qDebug() << "new connection " << cur_mTcpSocket->socketDescriptor();
     }
@@ -48,7 +50,19 @@ void MyTcpServer::slotServerRead() {
     string = string.left(string.length() - 2);
     qDebug() << string;
 
-    mParser->fparsing(string.toUtf8(), cur_mTcpSocket);
+    if (string.startsWith("start")) {
+        handle_start_message(cur_mTcpSocket, string);
+    } else if (string.startsWith("break")) {
+        handle_break_message(cur_mTcpSocket);
+    } else if (string.startsWith("stats")) {
+        handle_stats_message(cur_mTcpSocket);
+    } else if (string.startsWith("rooms")) {
+        handle_rooms_message(cur_mTcpSocket);
+    } else if (string.startsWith("newroom")) {
+        handle_newroom_message(cur_mTcpSocket, string);
+    } else {
+        cur_mTcpSocket->write("Unknown command\r\n");
+    }
 }
 
 void MyTcpServer::slotClientDisconnected() {
@@ -63,18 +77,41 @@ void MyTcpServer::slotClientDisconnected() {
   cur_mTcpSocket->close(); */
 }
 
-void MyTcpServer::handle_start_message(QTcpSocket *socket, QString login, QString roomname) {
-    if (!mQueues.contains(roomname)) {
-        socket->write("Queue does not exist\r\n");
+void MyTcpServer::handle_start_message(QTcpSocket *socket, const QString &message) {
+    QStringList parts = message.split("&");
+    if (parts.size() < 3) {
+        socket->write("Invalid message format\r\n");
         return;
     }
-    QList<QString> clients = mQueues[roomname];
-    if (clients.contains(login)) {
-        socket->write("You are already in the queue\r\n");
+    QString login = parts[1];
+    QString roomname = parts[2];
+
+    if (mQueues.contains(roomname)) {
+        QList<QString> clients = mQueues[roomname];
+        if (clients.size() == 7) {
+            QString response = "The queue is full. Clients in the queue:\r\n";
+            for (QString client : clients) {
+                response += "- " + client + "\r\n";
+            }
+            for (QTcpSocket *socket : mTcpSocket.values()) {
+                socket->write(response.toUtf8());
+                socket->disconnectFromHost();
+            }
+            mTcpServer->close();
+            return;
+        }
+        clients.append(login);
+        mQueues[roomname] = clients;
+    } else {
+        QList<QString> clients = { login };
+        mQueues[roomname] = clients;
+    }
+
+    QString stats = "0,0,0";
+    if (!SingletonDB::instance().addClient(login, roomname, stats)) {
+        socket->write("Failed to store client info in the database\r\n");
         return;
     }
-    mQueues[roomname].append(login);
-    socket->write("You are in the queue\r\n");
 }
 
 void MyTcpServer::handle_break_message(QTcpSocket *socket) {
@@ -82,27 +119,23 @@ void MyTcpServer::handle_break_message(QTcpSocket *socket) {
     QString roomname;
     for (QString key : mQueues.keys()) {
         QList<QString> clients = mQueues[key];
-        int index = clients.indexOf(socket->objectName());
-        if (index != -1) {
-            login = clients[index];
+        if (clients.contains(login)) {
             roomname = key;
-            clients.removeAt(index);
-            mQueues[key] = clients;
             break;
         }
     }
-    if (!login.isEmpty()) {
-        QString response = "You have been removed from queue " + roomname + "\r\n";
-        socket->write(response.toUtf8());
-    } else {
-        socket->write("You are not in any queue\r\n");
+    if (roomname.isEmpty()) {
+        socket->write("You are not in queue\r\n");
+        return;
     }
+    QList<QString> clients = mQueues[roomname];
+    clients.removeOne(login);
+    mQueues[roomname] = clients;
 }
 
 void MyTcpServer::handle_stats_message(QTcpSocket *socket) {
     QString response = "List of clients in queues:\r\n";
-    for (auto it = mQueues.begin(); it != mQueues.end(); ++it) {
-        QString key = it.key();
+    for (QString key : mQueues.keys()) {
         response += "Queue " + key + ":\r\n";
         QList<QString> clients = mQueues[key];
         if (clients.isEmpty()) {
@@ -117,7 +150,7 @@ void MyTcpServer::handle_stats_message(QTcpSocket *socket) {
 }
 
 void MyTcpServer::handle_rooms_message(QTcpSocket *socket) {
-    QString response = "List of rooms:\r\n";
+    QString response = "List of all queues:\r\n";
     for (QString key : mQueues.keys()) {
         response += "- " + key + "\r\n";
     }
@@ -125,16 +158,33 @@ void MyTcpServer::handle_rooms_message(QTcpSocket *socket) {
 }
 
 void MyTcpServer::handle_newroom_message(QTcpSocket *socket, const QString &message) {
-    QList<QString> parts = message.split('&');
+    QStringList parts = message.split("&");
     if (parts.size() < 2) {
         socket->write("Invalid message format\r\n");
         return;
     }
     QString roomname = parts[1];
     if (mQueues.contains(roomname)) {
-        socket->write("Room already exists\r\n");
+        socket->write("Queue with this name already exists\r\n");
         return;
     }
-    mQueues[roomname] = QList<QString>();
-    socket->write("Room created\r\n");
+    QList<QString> clients;
+    mQueues[roomname] = clients;
+
+    // Check if the queue already exists
+    QSqlQuery query = SingletonDB::instance().execute("SELECT * FROM rooms WHERE name = ?");
+    query.addBindValue(roomname);
+    if (query.exec() && query.next()) {
+        socket->write("Queue with this name already exists\r\n");
+        return;
+    }
+
+    // Add the new queue to the database
+    if (!SingletonDB::instance().addRoom(roomname)) {
+        socket->write("Failed to create new queue in the database\r\n");
+        return;
+    } else {
+        QList<QString> clients;
+        mQueues[roomname] = clients;
+    }
 }
